@@ -1,0 +1,47 @@
+DATASETS:
+  NAMES: "PRCC"
+  ROOT_DIR: "data/Data/ReIDData/VC-Clothes"
+
+INPUT:
+  SIZE_TRAIN: [256, 128]
+  SIZE_TEST: [256, 128]
+  REA: False
+  DO_FLIP: True
+  PADDING: 10
+
+DATALOADER:
+  NUM_WORKERS: 8
+  SAMPLER: "softmax_triplet"
+  NUM_INSTANCE: 4
+
+MODEL:
+  META_ARCHITECTURE: "build_transformer"
+  NAME: "ViT-B/16"
+  PRETRAIN_CHOICE: "imagenet"
+  STRIDE_SIZE: [16, 16]
+
+  IF_LABELSMOOTH: "on"
+  NO_MARGIN: False
+  NECK: "bnneck"
+
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 1.0
+  ITC_LOSS_WEIGHT: 0.5
+  USE_SUPCON: True
+
+SOLVER:
+  OPTIMIZER_NAME: "Adam"
+  BASE_LR: 3e-4
+  WEIGHT_DECAY: 5e-4
+  EPOCHS: 120
+  STEPS: [40, 70]
+  GAMMA: 0.1
+  IMS_PER_BATCH: 32
+  CHECKPOINT_PERIOD: 10
+  MARGIN: 0.3
+
+TEST:
+  IMS_PER_BATCH: 64
+  NECK_FEAT: "after"
+
+OUTPUT_DIR: "logs/prcc_clip"
