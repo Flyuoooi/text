@@ -68,13 +68,22 @@ _C.MODEL.CAA_LOSS_WEIGHT = 0.0
 _C.MODEL.ITC_LOSS_WEIGHT = 0.1
 _C.MODEL.CAA_T = 0.07
 
+# Text consistency: enforce masked text embedding stay close to clean embedding
+#（mask 掉衣物语义但保留身份锚点的必要约束；设为 0 即完全关闭）
+_C.MODEL.TEXT_CONSIST_WEIGHT = 0.0
+
 _C.MODEL.USE_ATTN_MASK = True     # attention-guided masking
 _C.MODEL.ATTN_MASK_RATIO = 0.5
 
-_C.MODEL.ID_PROJ_WEIGHT=0.5
-_C.MODEL.TRI_PROJ_WEIGHT=0.5
+_C.MODEL.ID_PROJ_WEIGHT=0.0
+_C.MODEL.TRI_PROJ_WEIGHT=0.0
 
 # _C.MODEL.TYPE= "no_proj"
+
+_C.MODEL.ATTN_MASK_PROB = 1.0
+_C.MODEL.ATTN_MASK_STRATEGY = "img_sim"
+_C.MODEL.ATTN_MASK_SELECT = "top"
+
 
 
 # -----------------------------------------------------------------------------
@@ -149,6 +158,10 @@ _C.TEST.TYPE = "image_only"
 _C.TEST.NECK_FEAT = "after"
 # Whether to use center crop when testing
 _C.TEST.CROP = True
+# baseline(backbone.py) 测试默认是 cat([main, proj])。
+# 为了避免“模型其实没差，只是评估特征选错了”这种坑，这里把默认改成 cat。
+# 如需只用主分支/投影分支，可在 yml 里显式设置 TEST.FEAT_SOURCE: "main" / "proj"。
+_C.TEST.FEAT_SOURCE="cat"
 
 # ---------------------------------------------------------------------------- #
 # Solver
@@ -177,9 +190,9 @@ _C.SOLVER.CENTER_LR = 0.5
 # Balanced weight of center loss
 _C.SOLVER.CENTER_LOSS_WEIGHT = 0.0005
 
-_C.SOLVER.BACKBONE_LR_SCALE = 0.01
-_C.SOLVER.PROMPT_LR_SCALE = 10.0
-_C.SOLVER.CAA_LR_SCALE = 1.0
+_C.SOLVER.BACKBONE_LR_SCALE = 0.1
+_C.SOLVER.PROMPT_LR_SCALE = 1.0
+_C.SOLVER.CAA_LR_SCALE = 01.0
 # Settings of weight decay
 _C.SOLVER.WEIGHT_DECAY = 0.0005
 _C.SOLVER.WEIGHT_DECAY_BIAS = 0.0005

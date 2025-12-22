@@ -213,31 +213,57 @@ class PromptLearner(nn.Module):
         # 3) 拼完整 prompt
         prompts = torch.cat([prefix, cls_ctx, suffix], dim=1)  # (B, L, C)
 
+        # if mask_mode == "none":
+        #     return prompts
+
+        # # 4) 使用 cloth_direction 做“衣物方向”的投影 mask
+        # L, C = prompts.shape[1], prompts.shape[2]
+        # P = prompts.reshape(B * L, C)             # (B*L, C)
+        # sim = torch.matmul(P, self.cloth_direction.t())  # (B*L, 1)
+        # projection = sim * self.cloth_direction          # (B*L, C)
+
+        # if torch.rand(1).item() < 0.01: # 偶尔打印
+        #      print(f"[DEBUG] Projection Norm: {projection.norm(dim=-1).mean().item():.4f}, Prompt Norm: {P.norm(dim=-1).mean().item():.4f}")
+
+        # P_masked = P - projection                        # (B*L, C)
+        # prompts_masked = P_masked.reshape(B, L, C)
+
+        # if mask_mode == "always":
+        #     return prompts_masked
+
+        # if mask_mode == "random":
+        #     mask_flag = (torch.rand(B, device=device) < self.mask_prob).float()
+        #     mask_flag = mask_flag.view(B, 1, 1)
+        #     prompts_final = prompts * (1.0 - mask_flag) + prompts_masked * mask_flag
+        #     return prompts_final
+
+
+        # 3) 先拿出 cls_ctx（只动它）
+# cls_ctx: (B, n_cls_ctx, C)
+
         if mask_mode == "none":
-            return prompts
+            return torch.cat([prefix, cls_ctx, suffix], dim=1)
 
-        # 4) 使用 cloth_direction 做“衣物方向”的投影 mask
-        L, C = prompts.shape[1], prompts.shape[2]
-        P = prompts.reshape(B * L, C)             # (B*L, C)
-        sim = torch.matmul(P, self.cloth_direction.t())  # (B*L, 1)
-        projection = sim * self.cloth_direction          # (B*L, C)
+        # 4) 仅在 cls_ctx 上做 cloth_direction 投影删除（不要动 suffix/EOT）
+        cloth_dir = self.cloth_direction.to(cls_ctx.dtype)          # (1, C)
+        B, K, C = cls_ctx.shape
+        ctx_flat = cls_ctx.reshape(B * K, C)                        # (B*K, C)
 
-        if torch.rand(1).item() < 0.01: # 偶尔打印
-             print(f"[DEBUG] Projection Norm: {projection.norm(dim=-1).mean().item():.4f}, Prompt Norm: {P.norm(dim=-1).mean().item():.4f}")
+        sim = ctx_flat @ cloth_dir.t()                              # (B*K, 1)
+        proj = sim * cloth_dir                                      # (B*K, C)
+        ctx_masked = (ctx_flat - proj).reshape(B, K, C)             # (B, K, C)
 
-        P_masked = P - projection                        # (B*L, C)
-        prompts_masked = P_masked.reshape(B, L, C)
+        prompts_ori = torch.cat([prefix, cls_ctx, suffix], dim=1)
+        prompts_masked = torch.cat([prefix, ctx_masked, suffix], dim=1)
 
         if mask_mode == "always":
             return prompts_masked
 
         if mask_mode == "random":
-            mask_flag = (torch.rand(B, device=device) < self.mask_prob).float()
-            mask_flag = mask_flag.view(B, 1, 1)
-            prompts_final = prompts * (1.0 - mask_flag) + prompts_masked * mask_flag
-            return prompts_final
+            mask_flag = (torch.rand(B, device=labels.device) < self.mask_prob).float().view(B, 1, 1)
+            return prompts_ori * (1.0 - mask_flag) + prompts_masked * mask_flag
 
-        return prompts
+        return prompts_ori
 
 
     def visualize_prompts(self):
@@ -381,6 +407,7 @@ class PromptLearner(nn.Module):
 class build_transformer(nn.Module):
     def __init__(self, num_classes, camera_num, view_num, cfg):
         super().__init__()
+        self.cfg = cfg
         self.model_name = cfg.MODEL.NAME
         self.cos_layer = cfg.MODEL.COS_LAYER
         self.neck = cfg.MODEL.NECK
@@ -462,6 +489,13 @@ class build_transformer(nn.Module):
         self.use_attn_mask = bool(getattr(cfg.MODEL, "USE_ATTN_MASK", True))
         self.attn_mask_ratio = float(getattr(cfg.MODEL, "ATTN_MASK_RATIO", 0.5))
 
+        # Attention-guided mask is powerful but can easily become too aggressive.
+        # We gate it by probability and allow different scoring strategies.
+        self.attn_mask_prob = float(getattr(cfg.MODEL, "ATTN_MASK_PROB", 1.0))
+        self.attn_mask_strategy = str(getattr(cfg.MODEL, "ATTN_MASK_STRATEGY", "img_sim")).lower()
+        self.attn_mask_select = str(getattr(cfg.MODEL, "ATTN_MASK_SELECT", "top")).lower()  # top / bottom
+
+
         # ---- CAA ----
         self.caa_t2v = nn.Linear(self.in_planes_proj, self.in_planes_proj)
         self.caa_v2t = nn.Linear(self.in_planes_proj, self.in_planes_proj)
@@ -469,26 +503,94 @@ class build_transformer(nn.Module):
         self.disc_r_v = CAADiscriminator(dim=self.in_planes_proj)
         self.disc_r_t = CAADiscriminator(dim=self.in_planes_proj)
 
-    def apply_attn_guided_mask(self, prompts, image_feat):
-        B, L, C = prompts.shape
-        prompts_f = prompts.float()
-        img_f = image_feat.float()
-        prompts_norm = F.normalize(prompts_f, dim=-1, eps=1e-6)
-        img_norm = F.normalize(img_f, dim=-1, eps=1e-6).unsqueeze(1)
-        attn = (prompts_norm * img_norm).sum(dim=-1)
+    def apply_attn_guided_mask(self, prompts, image_feat=None):
+        """Mask a subset of *ctx tokens* in the prompt.
 
-        prefix_len = self.prompt_learner.token_prefix.shape[1]
-        ctx_len = self.prompt_learner.cls_ctx.shape[1]
-        ctx_attn = attn[:, prefix_len: prefix_len + ctx_len]
-        k = max(1, int(self.attn_mask_ratio * ctx_len))
-        topk_idx = torch.topk(ctx_attn, k=k, dim=1).indices
-        topk_idx_global = topk_idx + prefix_len
-        mask = torch.zeros_like(attn, dtype=torch.bool)
-        mask.scatter_(1, topk_idx_global, True)
-        mask = mask.unsqueeze(-1).type_as(prompts)
+        Why this exists in your project:
+        - 你的核心目标是“衣物不变身份表征”。Prompt 的 cls_ctx 里会逐渐形成“身份/衣物”子语义。
+        - 这里的 masking 应该尽量**只打击衣物相关的 ctx token**，避免把身份锚点一起抹掉。
+        - 因此我们提供多种打分策略（img_sim / cloth_sim / hybrid），并支持 top/bottom 选择。
+
+        Args:
+            prompts: (B, L, C) full prompt embeddings = [prefix, cls_ctx, suffix]
+            image_feat: (B, C) image feature (typically feat_proj) used only when strategy needs it.
+        Returns:
+            prompts_masked: (B, L, C) masked prompt (only some ctx tokens zeroed)
+            scores: (B, L) token scores used for masking (float)
+            mask_bool: (B, L) bool mask positions (True means masked)
+        """
+        B, L, C = prompts.shape
+        device = prompts.device
+
+        prefix_len = int(self.prompt_learner.token_prefix.shape[1])
+        ctx_len = int(self.prompt_learner.cls_ctx.shape[1])
+
+        # Safety: no ctx -> no mask
+        if ctx_len <= 0:
+            scores = torch.zeros((B, L), device=device, dtype=torch.float32)
+            mask_bool = torch.zeros((B, L), device=device, dtype=torch.bool)
+            return prompts, scores, mask_bool
+
+        strategy = getattr(self, "attn_mask_strategy", "img_sim")
+        select = getattr(self, "attn_mask_select", "top")
+
+        # --- 1) compute token scores in fp32 for stability ---
+        prompts_f = prompts.float()
+        prompts_norm = F.normalize(prompts_f, dim=-1, eps=1e-6)  # (B,L,C)
+
+        if strategy in ("img", "img_sim", "image", "image_sim"):
+            if image_feat is None:
+                raise ValueError("apply_attn_guided_mask: image_feat is required for strategy='img_sim'.")
+            img_norm = F.normalize(image_feat.float(), dim=-1, eps=1e-6).unsqueeze(1)  # (B,1,C)
+            scores = (prompts_norm * img_norm).sum(dim=-1)  # (B,L)
+
+        elif strategy in ("cloth", "cloth_sim"):
+            # Use a stable clothing direction to find clothing-related ctx tokens.
+            cloth_dir = self.prompt_learner.cloth_direction.to(device=device).float()  # (1,C)
+            cloth_norm = F.normalize(cloth_dir, dim=-1, eps=1e-6).view(1, 1, C)       # (1,1,C)
+            scores = (prompts_norm * cloth_norm).sum(dim=-1)  # (B,L)
+
+        elif strategy in ("hybrid", "mix", "img+cloth"):
+            if image_feat is None:
+                raise ValueError("apply_attn_guided_mask: image_feat is required for strategy='hybrid'.")
+            img_norm = F.normalize(image_feat.float(), dim=-1, eps=1e-6).unsqueeze(1)  # (B,1,C)
+
+            cloth_dir = self.prompt_learner.cloth_direction.to(device=device).float()
+            cloth_norm = F.normalize(cloth_dir, dim=-1, eps=1e-6).view(1, 1, C)
+
+            s_img = (prompts_norm * img_norm).sum(dim=-1)
+            s_clo = (prompts_norm * cloth_norm).sum(dim=-1)
+
+            # normalize each score map to comparable scale (per-sample)
+            s_img = (s_img - s_img.mean(dim=1, keepdim=True)) / (s_img.std(dim=1, keepdim=True).clamp_min(1e-6))
+            s_clo = (s_clo - s_clo.mean(dim=1, keepdim=True)) / (s_clo.std(dim=1, keepdim=True).clamp_min(1e-6))
+            scores = 0.5 * s_img + 0.5 * s_clo
+        else:
+            # fallback: behave like img_sim
+            if image_feat is None:
+                raise ValueError(f"apply_attn_guided_mask: unknown strategy='{strategy}', and image_feat is None.")
+            img_norm = F.normalize(image_feat.float(), dim=-1, eps=1e-6).unsqueeze(1)
+            scores = (prompts_norm * img_norm).sum(dim=-1)
+
+        # --- 2) select ctx range only ---
+        ctx_scores = scores[:, prefix_len: prefix_len + ctx_len]  # (B, ctx_len)
+
+        k = max(1, int(float(self.attn_mask_ratio) * ctx_len))
+        if select in ("bottom", "low", "min"):
+            sel_idx = torch.topk(-ctx_scores, k=k, dim=1).indices
+        else:
+            sel_idx = torch.topk(ctx_scores, k=k, dim=1).indices
+
+        sel_idx_global = sel_idx + prefix_len  # map to full prompt indices
+
+        # --- 3) build mask and apply ---
+        mask_bool = torch.zeros((B, L), device=device, dtype=torch.bool)
+        mask_bool.scatter_(1, sel_idx_global, True)
+
+        mask = mask_bool.unsqueeze(-1).type_as(prompts)  # (B,L,1)
         prompts_masked = prompts * (1.0 - mask)
-        mask_bool = mask.squeeze(-1).bool()
-        return prompts_masked, attn, mask_bool
+        return prompts_masked, scores, mask_bool
+
 
     def forward(
         self,
@@ -505,16 +607,16 @@ class build_transformer(nn.Module):
         debug_n=2,
         **kwargs
     ):
-        if self.training and x is not None:
-            if torch.rand(1).item() < 0.7: 
-                if torch.rand(1).item() < 0.5:
-                    # 变灰
-                    x = x.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
-                else:
-                    # 简单的通道扰动：随机打乱 RGB 通道顺序
-                    # 比如把红衣服变成蓝衣服，强迫 ID Loss 彻底放弃颜色
-                    perm = torch.randperm(3, device=x.device)
-                    x = x[:, perm, :, :]
+        # if self.training and x is not None:
+        #     if torch.rand(1).item() < 0.7: 
+        #         if torch.rand(1).item() < 0.5:
+        #             # 变灰
+        #             x = x.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+        #         else:
+        #             # 简单的通道扰动：随机打乱 RGB 通道顺序
+        #             # 比如把红衣服变成蓝衣服，强迫 ID Loss 彻底放弃颜色
+        #             perm = torch.randperm(3, device=x.device)
+        #             x = x[:, perm, :, :]
 
         if get_text:
             prompts = self.prompt_learner(label, mask_mode="none")
@@ -563,14 +665,66 @@ class build_transformer(nn.Module):
         # 分类
         cls_score = self.classifier(feat)
         cls_score_proj = self.classifier_proj(feat_proj)
-
-        # ====== [Critical Fix for Test] 强制测试时使用 Proj 特征 ======
+        # ====== Test-time feature selection (robust) ======
+        # Why:
+        # 1) "cat" 直接拼接会让 main/proj 尺度漂移，导致距离被某一支主导 -> Rank-1 抖动/掉点
+        # 2) proj 分支更多受 ITC/CAA 约束，不一定对 ReID 最优；cat 时必须做分支内归一化+尺度平衡
         if not self.training:
-            if self.neck_feat == "after":
-                return feat_proj          # 修正: 返回 Projected BN 特征 (对齐空间)
-            else:
-                return img_feature_proj   # 修正: 返回 Projected Raw 特征
+            try:
+                feat_source = str(getattr(getattr(self.cfg, "TEST", None), "FEAT_SOURCE", "main")).lower()
+            except Exception:
+                feat_source = "main"
 
+            # pick pre/post-BN features according to cfg.TEST.NECK_FEAT
+            if self.neck_feat == "after":
+                main_feat = feat              # BN后的 main (768)
+                proj_feat = feat_proj         # BN后的 proj (512)
+            else:
+                main_feat = img_feature       # BN前 main (768)
+                proj_feat = img_feature_proj  # BN前 proj (512)
+
+            # --- helper: branch-wise normalize + balance ---
+            def _cat_balanced(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                # ensure fp32 for stable norm (esp. when amp/autocast)
+                a = a.float()
+                b = b.float()
+                a = F.normalize(a, dim=1, eps=1e-12)
+                b = F.normalize(b, dim=1, eps=1e-12)
+
+                # balance two branches so that one doesn't dominate simply due to dim/scale
+                # (after concat, evaluator will normalize again if cfg.TEST.FEAT_NORM == "yes")
+                da = float(a.size(1))
+                db = float(b.size(1))
+                a = a * (da ** 0.5)
+                b = b * (db ** 0.5)
+                return torch.cat([a, b], dim=1)
+
+            # Optional warning: using proj/cat while proj-supervision is off
+            # (proj still gets gradients via ITC/CAA, but it may not be optimal for retrieval)
+            if feat_source in ["proj", "cat"]:
+                try:
+                    id_pw = float(getattr(getattr(self.cfg, "MODEL", None), "ID_PROJ_WEIGHT", 0.0))
+                    tri_pw = float(getattr(getattr(self.cfg, "MODEL", None), "TRI_PROJ_WEIGHT", 0.0))
+                except Exception:
+                    id_pw, tri_pw = 0.0, 0.0
+                if (id_pw <= 0 and tri_pw <= 0) and not hasattr(self, "_warned_unsup_proj"):
+                    print(f"[WARN][FEAT_SOURCE={feat_source}] proj-branch has no ReID supervision "
+                        f"(ID_PROJ_WEIGHT/TRI_PROJ_WEIGHT are 0). "
+                        f"Using '{feat_source}' may hurt retrieval. Consider FEAT_SOURCE='main' for fair baseline check.")
+                    self._warned_unsup_proj = True
+
+            if feat_source == "proj":
+                return proj_feat.float()
+            if feat_source == "cat":
+                # robust cat: branch-wise norm + balanced concat
+                return _cat_balanced(main_feat, proj_feat)
+            if feat_source == "cat_raw":
+                # keep old behavior for debugging
+                return torch.cat([main_feat, proj_feat], dim=1)
+
+            # default: main
+            return main_feat.float()
+        
         # ====== 训练阶段 ======
         if not return_dict:
             # 原始模式
@@ -580,61 +734,93 @@ class build_transformer(nn.Module):
                 img_feature_proj,
             ]
         else:
+            # ==========================================================
+            # - CE/ID loss 用 BN 后特征 feat / feat_proj
+            # - Triplet loss 必须用 BN 前特征 img_feature / img_feature_proj
+            #   否则度量空间会被 BN 扭曲，最典型表现就是：
+            #     Same-Clothes 很高，但 Clothes-Changing 上不去
+            # ==========================================================
+
             outputs = {
-                "logits": cls_score,
-                "features": img_feature_last,
-                "bn_features": feat,
-                "logits_proj": cls_score_proj,
-                "features_proj": img_feature_proj,
-                "bn_features_proj": feat_proj,
-                "img_feat_proj": img_feature_proj,
-                "feat_proj": feat_proj,
+                # ---- main branch ----
+                "logits": cls_score,                  # CE 用这个（BN后）
+                "bn_features": feat,                  # BN后 768
+                "features": img_feature,              # Triplet 用这个（BN前 768）
+
+                # ---- proj branch (optional supervision) ----
+                "logits_proj": cls_score_proj,        # CE_proj 用这个（BN后）
+                "bn_features_proj": feat_proj,        # BN后 512
+                "features_proj": img_feature_proj,    # Triplet_proj 用这个（BN前 512）
+
+                # ---- cross-modal space ----
+                # ITC/CAA 用 raw CLIP projection 空间（更贴近 text encoder 输出分布）
+                "img_feat_proj": img_feature_proj,    # raw 512
+                "txt_feat_proj": None,                # masked text feat (filled later)
+                "txt_feat_clean": None,               # clean text feat (optional, for text consistency)
+
+                # ---- raw (debug/analysis) ----
                 "img_feature_last": img_feature_last,
                 "img_feature": img_feature,
                 "img_feature_proj": img_feature_proj,
+                "feat_proj": feat_proj,               # keep alias if you used it elsewhere
             }
             outputs["clothes_id"] = clothes_id
-            
+
             if label is None:
                 raise ValueError("return_dict=True requires `label` (pid) for prompt/text branch.")
-            
-            # ====== [Critical Fix for Train] 强制开启 Random Mask ======
-            # 这里原本是 "none"，导致 PromptLearner 里的去衣逻辑从未执行！
-            # 改为 "random" 后，会根据 MASK_PROB (0.5) 随机去除衣服方向
-            prompts = self.prompt_learner(label, mask_mode="random") 
 
-            tokenized = self.prompt_learner.tokenized_prompts.expand(prompts.size(0), -1).to(prompts.device)
+            # --------------------------
+            # Text branch: clean + masked
+            # --------------------------
+            tokenized = self.prompt_learner.tokenized_prompts.expand(img_feature.size(0), -1).to(img_feature.device)
+
+            # (A) clean prompt (no cloth-direction removal, no attn-mask)
+            prompts_clean = self.prompt_learner(label, mask_mode="none")
+            txt_clean = self.text_encoder(prompts_clean, tokenized)
+            outputs["txt_feat_clean"] = txt_clean
+
+            # (B) masked prompt (your designed cloth-direction suppression + optional attn-guided ctx mask)
+            prompts = self.prompt_learner(label, mask_mode="random")
 
             attn_scores = None
             mask_bool = None
 
             if self.use_attn_mask:
-                prompts, attn_scores, mask_bool = self.apply_attn_guided_mask(
-                    prompts,
-                    feat_proj.detach()
-                )
+                prob = float(getattr(self, "attn_mask_prob", 1.0))
+                do_mask = (prob >= 1.0) or (torch.rand((), device=prompts.device) < prob)
+                if bool(do_mask):
+                    # ====== 关键修复：guidance 用 raw img_feature_proj，而不是 BN 后 feat_proj ======
+                    prompts, attn_scores, mask_bool = self.apply_attn_guided_mask(
+                        prompts,
+                        img_feature_proj.detach(),   # <-- IMPORTANT
+                    )
 
-            text_features = self.text_encoder(prompts, tokenized)
-            outputs["txt_feat_proj"] = text_features
+            txt_masked = self.text_encoder(prompts, tokenized)
+            outputs["txt_feat_proj"] = txt_masked
             outputs["attn_scores"] = attn_scores.detach() if isinstance(attn_scores, torch.Tensor) else None
             outputs["ctx_mask"] = mask_bool.detach() if isinstance(mask_bool, torch.Tensor) else None
 
-            if debug:
-                try:
-                    coop_dbg = self.prompt_learner.dump_coop_debug(label, topk=debug_topk, max_labels=debug_n)
-                    if attn_scores is not None:
-                        coop_dbg["attn_scores_sample"] = attn_scores[:debug_n].detach().float().cpu()
-                    coop_dbg["feat_proj_sample"] = feat_proj[:debug_n].detach().float().cpu()
-                    outputs["coop_debug"] = coop_dbg
-                except Exception as e:
-                    outputs["coop_debug"] = {"error": str(e)}
+            # --------------------------
+            # Prompt mask stat (not a real loss)
+            # --------------------------
+            if self.use_attn_mask and (mask_bool is not None):
+                prefix_len = self.prompt_learner.token_prefix.shape[1]
+                ctx_len = self.prompt_learner.cls_ctx.shape[1]
+                ctx_mask = mask_bool[:, prefix_len:prefix_len + ctx_len]
+                outputs["prompt_mask_reg"] = ctx_mask.float().mean().detach()  # should be ~ATTN_MASK_RATIO
+            else:
+                outputs["prompt_mask_reg"] = torch.tensor(0.0, device=feat.device)
 
-            # CAA (目前权重设为0可忽略，保留代码结构)
-            feat_v = feat_proj
-            feat_t = text_features
+            # --------------------------
+            # CAA loss (keep your structure, but use raw proj space for consistency)
+            # --------------------------
+            feat_v = img_feature_proj          # raw proj
+            feat_t = txt_masked                # text proj
+
             t_to_v = self.caa_t2v(feat_t)
             r_v = feat_v - t_to_v
             v_corr = feat_v - self.caa_gamma * r_v
+
             v_to_t = self.caa_v2t(feat_v)
             r_t = feat_t - v_to_t
             t_corr = feat_t - self.caa_gamma * r_t
@@ -646,28 +832,20 @@ class build_transformer(nn.Module):
             caa_loss = caa_loss.to(feat.dtype)
             outputs["caa_loss"] = caa_loss
 
-            if self.use_attn_mask and (mask_bool is not None):
-                prefix_len = self.prompt_learner.token_prefix.shape[1]
-                ctx_len = self.prompt_learner.cls_ctx.shape[1]
-                ctx_mask = mask_bool[:, prefix_len:prefix_len+ctx_len]
-                outputs["prompt_mask_reg"] = ctx_mask.float().mean().detach()
-            else:
-                outputs["prompt_mask_reg"] = torch.tensor(0.0, device=feat.device)
-
-            outputs["debug"] = {
-                "img_feature_last": img_feature_last.detach(),
-                "img_feature": img_feature.detach(),
-                "img_feature_proj": img_feature_proj.detach(),
-                "attn_scores": attn_scores.detach() if self.use_attn_mask else None,
-                "t_to_v": t_to_v.detach(),
-                "r_v": r_v.detach(),
-                "v_corr": v_corr.detach(),
-                "v_to_t": v_to_t.detach(),
-                "r_t": r_t.detach(),
-                "t_corr": t_corr.detach(),
-            }
+            if debug:
+                outputs["debug"] = {
+                    "attn_scores": attn_scores.detach() if (attn_scores is not None) else None,
+                    "ctx_mask": mask_bool.detach() if (mask_bool is not None) else None,
+                    "t_to_v": t_to_v.detach(),
+                    "r_v": r_v.detach(),
+                    "v_corr": v_corr.detach(),
+                    "v_to_t": v_to_t.detach(),
+                    "r_t": r_t.detach(),
+                    "t_corr": t_corr.detach(),
+                }
 
             return outputs
+
 
     def load_param(self, trained_path):
         param_dict = torch.load(trained_path)
