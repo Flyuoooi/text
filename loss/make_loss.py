@@ -151,13 +151,18 @@ def make_loss(cfg, num_classes, device):
     tri_proj_weight = float(getattr(cfg.MODEL, "TRI_PROJ_WEIGHT", 0.0))
 
     # text consistency (masked vs clean)
-    txt_cons_w = float(getattr(cfg.MODEL, "TEXT_CONSIST_WEIGHT", 0.0))
+    txt_cons_weight = float(getattr(cfg.MODEL, "TEXT_CONSIST_WEIGHT", 0.0))
 
     if caa_weight > 0:
         print(f"Using CAA loss (from model outputs), weight={caa_weight}")
     else:
         print("CAA loss disabled (CAA_LOSS_WEIGHT <= 0)")
 
+    if itc_weight > 0 and txt_cons_weight <= 0 and caa_weight <= 0:
+            raise ValueError(
+                "ITC_LOSS_WEIGHT > 0 requires enabling TEXT_CONSIST_WEIGHT or CAA_LOSS_WEIGHT."
+            )
+    
     if itc_weight > 0:
         print(f"Using ITC loss (PID-proto InfoNCE), weight={itc_weight}, T={caa_temp}")
     else:
@@ -168,8 +173,8 @@ def make_loss(cfg, num_classes, device):
     else:
         print("Proj-branch supervision disabled (cfg weights are 0)")
 
-    if txt_cons_w > 0:
-        print(f"Using text consistency loss (masked vs clean), weight={txt_cons_w}")
+    if txt_cons_weight > 0:
+        print(f"Using text consistency loss (masked vs clean), weight={txt_cons_weight}")
     else:
         print("Text consistency loss disabled (TEXT_CONSIST_WEIGHT <= 0)")
 
@@ -234,7 +239,7 @@ def make_loss(cfg, num_classes, device):
             
         # 5) text consistency (optional)
         txt_clean = outputs.get("txt_feat_clean", None)
-        if txt_cons_w > 0 and txt_clean is not None and txt_p is not None:
+        if txt_cons_weight > 0 and txt_clean is not None and txt_p is not None:
             txt_clean_n = F.normalize(txt_clean.float(), dim=1, eps=1e-6)
             txt_p_n = F.normalize(txt_p.float(), dim=1, eps=1e-6)
             txt_cons = (1.0 - (txt_clean_n * txt_p_n).sum(dim=1)).mean()
@@ -258,7 +263,7 @@ def make_loss(cfg, num_classes, device):
             + id_proj_weight * id_loss_proj
             + tri_proj_weight * tri_loss_proj
             + itc_weight * itc
-            + txt_cons_w * txt_cons
+            + txt_cons_weight * txt_cons
             + caa_weight * caa_from_model
         )
         return total_loss, losses
