@@ -152,15 +152,16 @@ def make_loss(cfg, num_classes, device):
 
     # text consistency (masked vs clean)
     txt_cons_weight = float(getattr(cfg.MODEL, "TEXT_CONSIST_WEIGHT", 0.0))
+    resid_weight = float(getattr(cfg.MODEL, "RESID_LOSS_WEIGHT", 0.0))
 
     if caa_weight > 0:
         print(f"Using CAA loss (from model outputs), weight={caa_weight}")
     else:
         print("CAA loss disabled (CAA_LOSS_WEIGHT <= 0)")
 
-    if itc_weight > 0 and txt_cons_weight <= 0 and caa_weight <= 0:
+    if itc_weight > 0 and txt_cons_weight <= 0 and caa_weight <= 0 and resid_weight <= 0:
             raise ValueError(
-                "ITC_LOSS_WEIGHT > 0 requires enabling TEXT_CONSIST_WEIGHT or CAA_LOSS_WEIGHT."
+                "ITC_LOSS_WEIGHT > 0 requires enabling TEXT_CONSIST_WEIGHT, RESID_LOSS_WEIGHT, or CAA_LOSS_WEIGHT."
             )
     
     if itc_weight > 0:
@@ -177,6 +178,12 @@ def make_loss(cfg, num_classes, device):
         print(f"Using text consistency loss (masked vs clean), weight={txt_cons_weight}")
     else:
         print("Text consistency loss disabled (TEXT_CONSIST_WEIGHT <= 0)")
+
+    if resid_weight > 0:
+        print(f"Using residual consistency loss (resid vs clean), weight={resid_weight}")
+    else:
+        print("Residual consistency loss disabled (RESID_LOSS_WEIGHT <= 0)")
+
 
     # -------------------------
     # loss closure
@@ -247,16 +254,25 @@ def make_loss(cfg, num_classes, device):
             txt_cons = to_tensor(0.0)
         losses["txt_cons_loss"] = txt_cons
 
-        # 6) prompt mask stat (not a true loss)
-        mask_stat = to_tensor(outputs.get("prompt_mask_reg", 0.0))
-        losses["mask_loss"] = mask_stat
-        losses["mask_ratio"] = mask_stat
+        # 6) residual consistency (optional)
+        txt_resid = outputs.get("txt_feat_resid", None)
+        if resid_weight > 0 and txt_clean is not None and txt_resid is not None:
+            txt_clean_n = F.normalize(txt_clean.float(), dim=1, eps=1e-6)
+            txt_resid_n = F.normalize(txt_resid.float(), dim=1, eps=1e-6)
+            resid_cons = (1.0 - (txt_clean_n * txt_resid_n).sum(dim=1)).mean()
+        else:
+            resid_cons = to_tensor(0.0)
+        losses["resid_loss"] = resid_cons
 
-        # 7) CAA loss (from model)
+        # 7) prompt mask stat (not a true loss)
+        mask_stat = to_tensor(outputs.get("prompt_mask_reg", 0.0))
+        losses["mask_ratio"] = mask_stat
+        losses["mask_loss"] = mask_stat.detach() * 0.0
+
+        # 8) CAA loss (from model)
         caa_from_model = to_tensor(outputs.get("caa_loss", 0.0))
         losses["caa_loss"] = caa_from_model.detach()
 
-        # total
         total_loss = (
             id_loss
             + tri_loss
@@ -264,6 +280,7 @@ def make_loss(cfg, num_classes, device):
             + tri_proj_weight * tri_loss_proj
             + itc_weight * itc
             + txt_cons_weight * txt_cons
+            + resid_weight * resid_cons
             + caa_weight * caa_from_model
         )
         return total_loss, losses

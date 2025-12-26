@@ -725,7 +725,13 @@ def do_train(
                 if isinstance(attn, torch.Tensor):
                     print("attn_scores:", float(attn.mean()), float(attn.min()), float(attn.max()))
                 if isinstance(msk, torch.Tensor):
-                    print("ctx_mask ratio:", float(msk.float().mean()))
+                    msk = outputs["ctx_mask"]
+                    prefix_len = int(model.prompt_learner.token_prefix.shape[1])
+                    ctx_len = int(model.prompt_learner.cls_ctx.shape[1])
+                    ctx_msk = msk[:, prefix_len:prefix_len + ctx_len]  # (B, ctx_len)
+                    
+                    print("ctx_mask ratio (ctx only):", ctx_msk.float().mean().item())
+                    print("ctx_mask ratio (full prompt):", msk.float().mean().item())
                 dbg = outputs.get("debug", None)
                 if isinstance(dbg, dict):
                     for kk in ["attn_scores_sample", "mask_bool_sample"]:
@@ -790,6 +796,7 @@ def do_train(
             "triplet_loss": _lk("triplet_loss"),
             "itc_loss_raw": _lk("itc_loss"),
             "txt_cons_loss": _lk("txt_cons_loss"),
+            "resid_loss": _lk("resid_loss"),
             "mask_loss": _lk("mask_loss"),
             "caa_loss": _lk("caa_loss"),
             "rank1_pct": rank1_pct,
@@ -801,7 +808,7 @@ def do_train(
         }
 
         header = [
-            "epoch", "avg_loss", "id_loss", "triplet_loss", "itc_loss_raw", "txt_cons_loss", "mask_loss", "caa_loss",
+            "epoch", "avg_loss", "id_loss", "triplet_loss", "itc_loss_raw", "txt_cons_loss", "resid_loss", "mask_loss", "caa_loss",
             "rank1_pct", "mAP_pct", "lr_backbone", "lr_prompt", "lr_caa", "lr_other"
         ]
         _append_csv(csv_path, header, csv_row)
