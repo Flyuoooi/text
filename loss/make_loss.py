@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from .softmax_loss import CrossEntropyLabelSmooth
 from .triplet_loss import TripletLoss
 from .supcontrast import SupConLoss
+from .orthogonal_loss import OrthogonalLoss
 
 
 def _masked_logsumexp(x: torch.Tensor, mask: torch.Tensor, dim: int):
@@ -153,6 +154,13 @@ def make_loss(cfg, num_classes, device):
     # text consistency (masked vs clean)
     txt_cons_weight = float(getattr(cfg.MODEL, "TEXT_CONSIST_WEIGHT", 0.0))
     resid_weight = float(getattr(cfg.MODEL, "RESID_LOSS_WEIGHT", 0.0))
+    ortho_weight = float(getattr(cfg.MODEL, "ORTHO_LOSS_WEIGHT", 0.0))
+    ortho_loss_fn = OrthogonalLoss().to(device)
+
+    if itc_weight > 0 and txt_cons_weight <= 0 and caa_weight <= 0:
+        raise ValueError(
+            "ITC_LOSS_WEIGHT > 0 requires enabling TEXT_CONSIST_WEIGHT or CAA_LOSS_WEIGHT."
+        )
 
     if caa_weight > 0:
         print(f"Using CAA loss (from model outputs), weight={caa_weight}")
@@ -168,7 +176,6 @@ def make_loss(cfg, num_classes, device):
         print(f"Using ITC loss (PID-proto InfoNCE), weight={itc_weight}, T={caa_temp}")
     else:
         print("ITC loss disabled (ITC_LOSS_WEIGHT <= 0)")
-
     if id_proj_weight > 0 or tri_proj_weight > 0:
         print(f"Using proj-branch supervision: ID_PROJ_WEIGHT={id_proj_weight}, TRI_PROJ_WEIGHT={tri_proj_weight}")
     else:
@@ -178,11 +185,14 @@ def make_loss(cfg, num_classes, device):
         print(f"Using text consistency loss (masked vs clean), weight={txt_cons_weight}")
     else:
         print("Text consistency loss disabled (TEXT_CONSIST_WEIGHT <= 0)")
-
     if resid_weight > 0:
         print(f"Using residual consistency loss (resid vs clean), weight={resid_weight}")
     else:
         print("Residual consistency loss disabled (RESID_LOSS_WEIGHT <= 0)")
+    if ortho_weight > 0:
+        print(f"Using orthogonal loss (img vs cloth direction), weight={ortho_weight}")
+    else:
+        print("Orthogonal loss disabled (ORTHO_LOSS_WEIGHT <= 0)")
 
 
     # -------------------------
@@ -269,7 +279,16 @@ def make_loss(cfg, num_classes, device):
         losses["mask_ratio"] = mask_stat
         losses["mask_loss"] = mask_stat.detach() * 0.0
 
-        # 8) CAA loss (from model)
+        # 8) orthogonal loss: push img_feat_proj away from cloth direction
+        img_proj = outputs.get("img_feat_proj", None)
+        cloth_dir = outputs.get("cloth_direction", None)
+        if ortho_weight > 0:
+            ortho_loss = ortho_loss_fn(img_proj, cloth_dir, fallback=to_tensor(0.0))
+        else:
+            ortho_loss = to_tensor(0.0)
+        losses["ortho_loss"] = ortho_loss
+
+        # 9) CAA loss (from model)
         caa_from_model = to_tensor(outputs.get("caa_loss", 0.0))
         losses["caa_loss"] = caa_from_model.detach()
 
@@ -281,6 +300,7 @@ def make_loss(cfg, num_classes, device):
             + itc_weight * itc
             + txt_cons_weight * txt_cons
             + resid_weight * resid_cons
+            + ortho_weight * ortho_loss
             + caa_weight * caa_from_model
         )
         return total_loss, losses

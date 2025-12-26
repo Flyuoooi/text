@@ -71,6 +71,8 @@ _C.MODEL.CAA_T = 0.07
 # Text consistency: enforce masked text embedding stay close to clean embedding
 #（mask 掉衣物语义但保留身份锚点的必要约束；设为 0 即完全关闭）
 _C.MODEL.TEXT_CONSIST_WEIGHT = 0.0
+_C.MODEL.ORTHO_LOSS_WEIGHT = 0.0
+_C.MODEL.RESID_LOSS_WEIGHT = 0.1
 
 _C.MODEL.USE_ATTN_MASK = True     # attention-guided masking
 _C.MODEL.ATTN_MASK_RATIO = 0.5
