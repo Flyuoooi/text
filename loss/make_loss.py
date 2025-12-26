@@ -155,18 +155,17 @@ def make_loss(cfg, num_classes, device):
     txt_cons_weight = float(getattr(cfg.MODEL, "TEXT_CONSIST_WEIGHT", 0.0))
     resid_weight = float(getattr(cfg.MODEL, "RESID_LOSS_WEIGHT", 0.0))
     ortho_weight = float(getattr(cfg.MODEL, "ORTHO_LOSS_WEIGHT", 0.0))
+    use_vis_cloth_dir = bool(getattr(cfg.MODEL, "VIS_CLOTH_DIR", False))
     ortho_loss_fn = OrthogonalLoss().to(device)
 
     if itc_weight > 0 and txt_cons_weight <= 0 and caa_weight <= 0:
         raise ValueError(
             "ITC_LOSS_WEIGHT > 0 requires enabling TEXT_CONSIST_WEIGHT or CAA_LOSS_WEIGHT."
         )
-
     if caa_weight > 0:
         print(f"Using CAA loss (from model outputs), weight={caa_weight}")
     else:
         print("CAA loss disabled (CAA_LOSS_WEIGHT <= 0)")
-
     if itc_weight > 0 and txt_cons_weight <= 0 and caa_weight <= 0 and resid_weight <= 0:
             raise ValueError(
                 "ITC_LOSS_WEIGHT > 0 requires enabling TEXT_CONSIST_WEIGHT, RESID_LOSS_WEIGHT, or CAA_LOSS_WEIGHT."
@@ -180,7 +179,6 @@ def make_loss(cfg, num_classes, device):
         print(f"Using proj-branch supervision: ID_PROJ_WEIGHT={id_proj_weight}, TRI_PROJ_WEIGHT={tri_proj_weight}")
     else:
         print("Proj-branch supervision disabled (cfg weights are 0)")
-
     if txt_cons_weight > 0:
         print(f"Using text consistency loss (masked vs clean), weight={txt_cons_weight}")
     else:
@@ -190,7 +188,8 @@ def make_loss(cfg, num_classes, device):
     else:
         print("Residual consistency loss disabled (RESID_LOSS_WEIGHT <= 0)")
     if ortho_weight > 0:
-        print(f"Using orthogonal loss (img vs cloth direction), weight={ortho_weight}")
+        dir_source = "visual" if use_vis_cloth_dir else "text"
+        print(f"Using orthogonal loss ({dir_source} cloth direction), weight={ortho_weight}")
     else:
         print("Orthogonal loss disabled (ORTHO_LOSS_WEIGHT <= 0)")
 
@@ -282,12 +281,26 @@ def make_loss(cfg, num_classes, device):
         # 8) orthogonal loss: push img_feat_proj away from cloth direction
         img_proj = outputs.get("img_feat_proj", None)
         cloth_dir = outputs.get("cloth_direction", None)
+        if use_vis_cloth_dir and img_proj is not None:
+            clothes_id = outputs.get("clothes_id", None)
+            if clothes_id is not None:
+                uniq = torch.unique(clothes_id)
+                centers = []
+                for cid in uniq:
+                    mask = clothes_id == cid
+                    if mask.any():
+                        centers.append(img_proj[mask].mean(dim=0))
+                if centers:
+                    cloth_dir = torch.stack(centers, dim=0).mean(dim=0, keepdim=True).detach()
         if ortho_weight > 0:
-            ortho_loss = ortho_loss_fn(img_proj, cloth_dir, fallback=to_tensor(0.0))
+            ortho_loss, ortho_stats = ortho_loss_fn(img_proj, cloth_dir, fallback=to_tensor(0.0))
+            losses["ortho_cos_mean"] = ortho_stats.get("ortho_cos_mean", to_tensor(0.0))
+            losses["ortho_cos_max"] = ortho_stats.get("ortho_cos_max", to_tensor(0.0))
         else:
             ortho_loss = to_tensor(0.0)
+            losses["ortho_cos_mean"] = to_tensor(0.0)
+            losses["ortho_cos_max"] = to_tensor(0.0)
         losses["ortho_loss"] = ortho_loss
-
         # 9) CAA loss (from model)
         caa_from_model = to_tensor(outputs.get("caa_loss", 0.0))
         losses["caa_loss"] = caa_from_model.detach()
