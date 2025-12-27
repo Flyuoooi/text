@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from .softmax_loss import CrossEntropyLabelSmooth
 from .triplet_loss import TripletLoss
 from .supcontrast import SupConLoss
+from .orthogonal_loss import OrthogonalLoss
 
 
 def _masked_logsumexp(x: torch.Tensor, mask: torch.Tensor, dim: int):
@@ -152,6 +153,14 @@ def make_loss(cfg, num_classes, device):
 
     # text consistency (masked vs clean)
     txt_cons_w = float(getattr(cfg.MODEL, "TEXT_CONSIST_WEIGHT", 0.0))
+    ortho_w = float(getattr(cfg.MODEL, "ORTHO_LOSS_WEIGHT", 0.0))
+    use_vis_cloth_dir = bool(getattr(cfg.MODEL, "VIS_CLOTH_DIR", False))
+    ortho_loss_fn = OrthogonalLoss().to(device)
+
+    if itc_weight > 0 and txt_cons_w <= 0 and caa_weight <= 0:
+        raise ValueError(
+            "ITC_LOSS_WEIGHT > 0 requires enabling TEXT_CONSIST_WEIGHT or CAA_LOSS_WEIGHT."
+        )
 
     if caa_weight > 0:
         print(f"Using CAA loss (from model outputs), weight={caa_weight}")
@@ -172,6 +181,12 @@ def make_loss(cfg, num_classes, device):
         print(f"Using text consistency loss (masked vs clean), weight={txt_cons_w}")
     else:
         print("Text consistency loss disabled (TEXT_CONSIST_WEIGHT <= 0)")
+
+    if ortho_w > 0:
+        dir_source = "visual" if use_vis_cloth_dir else "text"
+        print(f"Using orthogonal loss ({dir_source} cloth direction), weight={ortho_w}")
+    else:
+        print("Orthogonal loss disabled (ORTHO_LOSS_WEIGHT <= 0)")
 
     # -------------------------
     # loss closure
@@ -247,6 +262,30 @@ def make_loss(cfg, num_classes, device):
         losses["mask_loss"] = mask_stat
         losses["mask_ratio"] = mask_stat
 
+        # 6.5) orthogonal loss: push img_feat_proj away from cloth direction
+        img_proj = outputs.get("img_feat_proj", None)
+        cloth_dir = outputs.get("cloth_direction", None)
+        if use_vis_cloth_dir and img_proj is not None:
+            clothes_id = outputs.get("clothes_id", None)
+            if clothes_id is not None:
+                uniq = torch.unique(clothes_id)
+                centers = []
+                for cid in uniq:
+                    mask = clothes_id == cid
+                    if mask.any():
+                        centers.append(img_proj[mask].mean(dim=0))
+                if centers:
+                    cloth_dir = torch.stack(centers, dim=0).mean(dim=0, keepdim=True).detach()
+        if ortho_w > 0:
+            ortho_loss, ortho_stats = ortho_loss_fn(img_proj, cloth_dir, fallback=to_tensor(0.0))
+            losses["ortho_cos_mean"] = ortho_stats.get("ortho_cos_mean", to_tensor(0.0))
+            losses["ortho_cos_max"] = ortho_stats.get("ortho_cos_max", to_tensor(0.0))
+        else:
+            ortho_loss = to_tensor(0.0)
+            losses["ortho_cos_mean"] = to_tensor(0.0)
+            losses["ortho_cos_max"] = to_tensor(0.0)
+        losses["ortho_loss"] = ortho_loss
+
         # 7) CAA loss (from model)
         caa_from_model = to_tensor(outputs.get("caa_loss", 0.0))
         losses["caa_loss"] = caa_from_model.detach()
@@ -259,6 +298,7 @@ def make_loss(cfg, num_classes, device):
             + tri_proj_weight * tri_loss_proj
             + itc_weight * itc
             + txt_cons_w * txt_cons
+            + ortho_w * ortho_loss
             + caa_weight * caa_from_model
         )
         return total_loss, losses

@@ -65,8 +65,10 @@ _C.MODEL.MASK_PROB = 0.5
 # CAA 残差校正强度 γ
 _C.MODEL.CAA_GAMMA = 0.5
 _C.MODEL.CAA_LOSS_WEIGHT = 0.0
-_C.MODEL.ITC_LOSS_WEIGHT = 0.1
+_C.MODEL.ITC_LOSS_WEIGHT = 0.0
 _C.MODEL.CAA_T = 0.07
+_C.MODEL.ORTHO_LOSS_WEIGHT = 0.0
+_C.MODEL.VIS_CLOTH_DIR = False
 
 # Text consistency: enforce masked text embedding stay close to clean embedding
 #（mask 掉衣物语义但保留身份锚点的必要约束；设为 0 即完全关闭）

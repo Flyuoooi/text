@@ -757,6 +757,7 @@ class build_transformer(nn.Module):
                 "img_feat_proj": img_feature_proj,    # raw 512
                 "txt_feat_proj": None,                # masked text feat (filled later)
                 "txt_feat_clean": None,               # clean text feat (optional, for text consistency)
+                "cloth_direction": self.prompt_learner.cloth_direction,
 
                 # ---- raw (debug/analysis) ----
                 "img_feature_last": img_feature_last,

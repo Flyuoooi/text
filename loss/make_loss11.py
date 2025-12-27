@@ -114,9 +114,12 @@ def make_loss(cfg, num_classes, device):
         print("CAA loss disabled (CAA_LOSS_WEIGHT <= 0)")
 
     if itc_weight > 0:
+        if caa_weight <= 0:
+            raise ValueError("ITC_LOSS_WEIGHT > 0 requires enabling CAA_LOSS_WEIGHT.")
         print(f"Using ITC loss (InfoNCE / CLIP-style), weight={itc_weight}, T={caa_temp}")
     else:
         print("ITC loss disabled (ITC_LOSS_WEIGHT <= 0)")
+
 
     # ============================================================
     #   真正的 loss 函数：返回 total_loss, loss_dict
@@ -193,6 +196,7 @@ def make_loss(cfg, num_classes, device):
         mask_loss = outputs.get("prompt_mask_reg", 0.0)
         mask_loss = to_tensor(mask_loss)
         losses["mask_loss"] = mask_loss
+
 
         # ---------------------------------------------------------
         # 5) CAA residual / 对抗循环那条支路的损失

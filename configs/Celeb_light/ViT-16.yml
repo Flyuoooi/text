@@ -1,7 +1,7 @@
 MODEL:
   ID_LOSS_WEIGHT: 1.0
   TRIPLET_LOSS_WEIGHT: 1.0
-  ITC_LOSS_WEIGHT: 0.5     # SupConLoss权重
+  ITC_LOSS_WEIGHT: 0.0     # SupConLoss权重 (baseline; ITC>0 requires TEXT_CONSIST_WEIGHT or CAA_LOSS_WEIGHT)
   USE_SUPCON: True
 
 DATA:
@@ -29,5 +29,4 @@ TEST:
   FEAT_NORM: 'yes'
   
 OUTPUT_DIR: '../MADE/logs'
-
 
